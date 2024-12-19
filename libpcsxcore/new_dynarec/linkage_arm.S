@@ -36,6 +36,11 @@
 #define execI			ESYM(execI)
 #endif
 
+/* make mini_ht reachable with a single armv4 insn */
+#if (LO_mini_ht & ~0xff0)
+#error misligned mini_ht
+#endif
+
 	.bss
 	.align	4
 	.global dynarec_local
@@ -81,6 +86,7 @@ DRC_VAR(zeromem_ptr, 4)
 DRC_VAR(invc_ptr, 4)
 DRC_VAR(scratch_buf_ptr, 4)
 DRC_VAR(ram_offset, 4)
+DRC_VAR(hash_table_ptr, 4)
 DRC_VAR(mini_ht, 256)
 
 
@@ -150,14 +156,16 @@ FUNCTION(dyna_linker):
 	mov	r5, r1
 	lsl	r6, r6, #8
 	/* must not compile - that might expire the caller block */
-	mov	r1, #0 /* ndrc_compile_mode */
+	ldr     r0, [fp, #LO_hash_table_ptr]
+	mov     r1, r4
+	mov	r2, #0 /* ndrc_compile_mode=ndrc_cm_no_compile */
 	bl	ndrc_get_addr_ht_param
 
 	movs	r8, r0
 	beq	0f
 	add	r6, r5, r6, asr #6  /* old target */
 	teq	r0, r6
-	moveq	pc, r0 /* Stale i-cache */
+	bxeq	r0     /* Stale i-cache */
 	mov	r0, r4
 	mov	r1, r6
 	bl	ndrc_add_jump_out
@@ -168,14 +176,15 @@ FUNCTION(dyna_linker):
 	sub	r1, r1, #2
 	add	r1, r1, r2, lsr #8
 	str	r1, [r5]
-	mov	pc, r8
+	bx	r8
 0:
 	mov	r0, r4
 #else
 	/* XXX: should be able to do better than this... */
 #endif
+	ldr     r1, [fp, #LO_hash_table_ptr]
 	bl	ndrc_get_addr_ht
-	mov	pc, r0
+	bx	r0
 	.size	dyna_linker, .-dyna_linker
 
 	.align	2
@@ -223,8 +232,9 @@ FUNCTION(jump_vaddr_r7):
 	add	r0, r7, #0
 	.size	jump_vaddr_r7, .-jump_vaddr_r7
 FUNCTION(jump_vaddr_r0):
+	ldr     r1, [fp, #LO_hash_table_ptr]
 	bl	ndrc_get_addr_ht
-	mov	pc, r0
+	bx	r0
 	.size	jump_vaddr_r0, .-jump_vaddr_r0
 
 	.align	2
@@ -247,9 +257,10 @@ FUNCTION(cc_interrupt):
 	tst	r2, r2
 	ldmfdne	sp!, {r4, r5, r6, r7, r8, r9, sl, fp, ip, pc}
 	cmp	r0, r9
-	moveq	pc, lr
+	bxeq	lr
+	ldr     r1, [fp, #LO_hash_table_ptr]
 	bl	ndrc_get_addr_ht
-	mov	pc, r0
+	bx	r0
 	.size	cc_interrupt, .-cc_interrupt
 
 	.align	2
@@ -304,8 +315,9 @@ FUNCTION(jump_to_new_pc):
 	str	r1, [fp, #LO_last_count]
 	sub	r10, r10, r1
 	bne	new_dyna_leave
+	ldr     r1, [fp, #LO_hash_table_ptr]
 	bl	ndrc_get_addr_ht
-	mov	pc, r0
+	bx	r0
 	.size	jump_to_new_pc, .-jump_to_new_pc
 
 	.align	2
@@ -408,13 +420,14 @@ FUNCTION(new_dyna_start):
 	stmfd	sp!, {r4, r5, r6, r7, r8, r9, sl, fp, ip, lr}
 	mov	fp, r0 /* dynarec_local */
 	ldr	r0, [fp, #LO_pcaddr]
+	ldr     r1, [fp, #LO_hash_table_ptr]
 	bl	ndrc_get_addr_ht
 new_dyna_start_at_e:
 	ldr	r1, [fp, #LO_next_interupt]
 	ldr	r10, [fp, #LO_cycle]
 	str	r1, [fp, #LO_last_count]
 	sub	r10, r10, r1
-	mov	pc, r0
+	bx	r0
 	.size	new_dyna_start, .-new_dyna_start
 
 /* --------------------------------------- */
@@ -443,7 +456,7 @@ new_dyna_start_at_e:
 .else
 	\readop	r0, [r1, r3, lsl #\tab_shift]
 .endif
-	movcc	pc, lr
+	bxcc	lr
 	mov	r2, r12
 	str	r12, [fp, #LO_cycle]
 .endm
@@ -482,7 +495,7 @@ FUNCTION(jump_handler_read32):
 .else
 	\wrtop	r1, [r3, r12, lsl #\tab_shift]
 .endif
-	movcc	pc, lr
+	bxcc	lr
 	ldr	r12, [fp, #LO_last_count]
 	mov     r0, r1
 	add	r2, r2, r12
