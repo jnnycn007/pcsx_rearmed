@@ -129,19 +129,17 @@ void emu_set_default_config(void)
 	Config.GpuListWalking = -1;
 	Config.FractionalFramerate = -1;
 
+	pl_rearmed_cbs.dithering = 1;
 	pl_rearmed_cbs.gpu_neon.allow_interlace = 2; // auto
-	pl_rearmed_cbs.gpu_neon.allow_dithering = 1;
 	pl_rearmed_cbs.gpu_neon.enhancement_enable =
 	pl_rearmed_cbs.gpu_neon.enhancement_no_main = 0;
 	pl_rearmed_cbs.gpu_neon.enhancement_tex_adj = 1;
-	pl_rearmed_cbs.gpu_peops.iUseDither = 0;
 	pl_rearmed_cbs.gpu_peops.dwActFixes = 1<<7;
 	pl_rearmed_cbs.gpu_unai.old_renderer = 0;
 	pl_rearmed_cbs.gpu_unai.ilace_force = 0;
 	pl_rearmed_cbs.gpu_unai.lighting = 1;
 	pl_rearmed_cbs.gpu_unai.fast_lighting = 0;
 	pl_rearmed_cbs.gpu_unai.blending = 1;
-	pl_rearmed_cbs.gpu_unai.dithering = 0;
 	memset(&pl_rearmed_cbs.gpu_peopsgl, 0, sizeof(pl_rearmed_cbs.gpu_peopsgl));
 	pl_rearmed_cbs.gpu_peopsgl.iVRamSize = 64;
 	pl_rearmed_cbs.gpu_peopsgl.iTexGarbageCollection = 1;
@@ -512,6 +510,16 @@ int emu_core_init(void)
 {
 	SysPrintf("Starting PCSX-ReARMed " REV "%s\n", get_build_info());
 	SysPrintf("build time: " __DATE__ " " __TIME__ "\n");
+
+#if defined(__arm__) && defined(__ARM_FP)
+	// RunFast mode
+	u32 fpscr = ~0;
+	__asm__ volatile("vmrs %0, fpscr" : "=r"(fpscr));
+	SysPrintf("old fpscr = %08x\n", fpscr);
+	fpscr &= ~0x00009f9f;
+	fpscr |=  0x03000000; // DN | FZ
+	__asm__ volatile("vmsr fpscr, %0" :: "r"(fpscr));
+#endif
 
 #ifdef HAVE_RTHREADS
 	pcsxr_sthread_init();

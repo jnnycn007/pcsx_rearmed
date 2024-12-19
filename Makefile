@@ -229,7 +229,7 @@ plugins/dfsound/out.o: CFLAGS += -DHAVE_LIBRETRO
 endif
 
 # builtin gpu
-OBJS += plugins/gpulib/gpu.o plugins/gpulib/vout_pl.o
+OBJS += plugins/gpulib/gpu.o plugins/gpulib/vout_pl.o plugins/gpulib/prim.o
 ifeq "$(BUILTIN_GPU)" "neon"
 CFLAGS += -DGPU_NEON
 OBJS += plugins/gpu_neon/psx_gpu_if.o
@@ -272,9 +272,12 @@ OBJS += plugins/gpu_unai/old/if.o
 else
 CFLAGS += -DGPU_UNAI_NO_OLD
 endif
+plugins/gpu_unai/gpulib_if.o: plugins/gpu_unai/*.h
 plugins/gpu_unai/gpulib_if.o: CFLAGS += -DREARMED -DUSE_GPULIB=1
+ifneq ($(DEBUG), 1)
 plugins/gpu_unai/gpulib_if.o \
 plugins/gpu_unai/old/if.o: CFLAGS += -O3
+endif
 CC_LINK = $(CXX)
 endif
 
@@ -472,8 +475,8 @@ target_: $(TARGET)
 
 $(TARGET): $(OBJS)
 ifeq ($(PARTIAL_LINKING), 1)
-	$(LD) -o $(basename $(TARGET))1.o -r --gc-sections $(addprefix -u , $(shell cat frontend/libretro-extern)) $^
-	$(OBJCOPY) --keep-global-symbols=frontend/libretro-extern $(basename $(TARGET))1.o $(basename $(TARGET)).o
+	$(LD) -o $(basename $(TARGET))1.o -r --gc-sections $(addprefix -u ,$(shell cat frontend/libretro-extern)) $(addprefix -u ,$(EXTRA_EXTERN_SYMS)) $^
+	$(OBJCOPY) --keep-global-symbols=frontend/libretro-extern $(addprefix -G ,$(EXTRA_EXTERN_SYMS)) $(basename $(TARGET))1.o $(basename $(TARGET)).o
 	$(AR) rcs $@ $(basename $(TARGET)).o
 else ifeq ($(STATIC_LINKING), 1)
 	$(AR) rcs $@ $^

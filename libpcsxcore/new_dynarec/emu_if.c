@@ -17,6 +17,7 @@
 #include "../gte_arm.h"
 #include "../gte_neon.h"
 #include "compiler_features.h"
+#include "arm_features.h"
 #define FLAGLESS
 #include "../gte.h"
 #ifdef NDRC_THREAD
@@ -303,10 +304,10 @@ static void ari64_apply_config()
 	else
 		ndrc_g.hacks &= ~NDHACK_NO_STALLS;
 
-	thread_changed = (ndrc_g.hacks ^ ndrc_g.hacks_old)
+	thread_changed = ((ndrc_g.hacks | ndrc_g.hacks_pergame) ^ ndrc_g.hacks_old)
 		& (NDHACK_THREAD_FORCE | NDHACK_THREAD_FORCE_ON);
 	if (Config.cycle_multiplier != ndrc_g.cycle_multiplier_old
-	    || ndrc_g.hacks != ndrc_g.hacks_old)
+	    || (ndrc_g.hacks | ndrc_g.hacks_pergame) != ndrc_g.hacks_old)
 	{
 		new_dynarec_clear_full();
 	}
@@ -317,24 +318,34 @@ static void ari64_apply_config()
 #ifdef NDRC_THREAD
 static void clear_local_cache(void)
 {
-#ifdef _3DS
-	if (ndrc_g.thread.cache_dirty) {
-		ndrc_g.thread.cache_dirty = 0;
-		ctr_invalidate_icache();
-	}
+#if defined(__arm__) || defined(__aarch64__)
+	if (ndrc_g.thread.dirty_start) {
+		// see "Ensuring the visibility of updates to instructions"
+		// in v7/v8 reference manuals (DDI0406, DDI0487 etc.)
+#if defined(__aarch64__) || defined(HAVE_ARMV8)
+		// the actual clean/invalidate is broadcast to all cores,
+		// the manual only prescribes an isb
+		__asm__ volatile("isb");
+//#elif defined(_3DS)
+//		ctr_invalidate_icache();
 #else
-	// hopefully nothing is needed, as tested on r-pi4 and switch
+		// while on v6 this is always required, on v7 it depends on
+		// "Multiprocessing Extensions" being present, but that is difficult
+		// to detect so do it always for now
+		new_dyna_clear_cache(ndrc_g.thread.dirty_start, ndrc_g.thread.dirty_end);
+#endif
+		ndrc_g.thread.dirty_start = ndrc_g.thread.dirty_end = 0;
+	}
 #endif
 }
 
 static noinline void ari64_execute_threaded_slow(struct psxRegisters *regs,
 	enum blockExecCaller block_caller)
 {
-	if (!ndrc_g.thread.busy) {
+	if (ndrc_g.thread.busy_addr == ~0u) {
 		memcpy(ndrc_smrv_regs, regs->GPR.r, sizeof(ndrc_smrv_regs));
 		slock_lock(ndrc_g.thread.lock);
-		ndrc_g.thread.addr = regs->pc;
-		ndrc_g.thread.busy = 1;
+		ndrc_g.thread.busy_addr = regs->pc;
 		slock_unlock(ndrc_g.thread.lock);
 		scond_signal(ndrc_g.thread.cond);
 	}
@@ -345,7 +356,7 @@ static noinline void ari64_execute_threaded_slow(struct psxRegisters *regs,
 	{
 		psxInt.ExecuteBlock(regs, block_caller);
 	}
-	while (!regs->stop && ndrc_g.thread.busy && block_caller == EXEC_CALLER_OTHER);
+	while (!regs->stop && ndrc_g.thread.busy_addr != ~0u && block_caller == EXEC_CALLER_OTHER);
 
 	psxInt.Notify(R3000ACPU_NOTIFY_BEFORE_SAVE, NULL);
 	//ari64_notify(R3000ACPU_NOTIFY_AFTER_LOAD, NULL);
@@ -356,11 +367,13 @@ static void ari64_execute_threaded_once(struct psxRegisters *regs,
 	enum blockExecCaller block_caller)
 {
 	void *drc_local = (char *)regs - LO_psxRegs;
+	struct ht_entry *hash_table =
+		*(void **)((char *)drc_local + LO_hash_table_ptr);
 	void *target;
 
-	if (likely(!ndrc_g.thread.busy)) {
-		ndrc_g.thread.addr = 0;
-		target = ndrc_get_addr_ht_param(regs->pc, ndrc_cm_no_compile);
+	if (likely(ndrc_g.thread.busy_addr == ~0u)) {
+		target = ndrc_get_addr_ht_param(hash_table, regs->pc,
+				ndrc_cm_no_compile);
 		if (target) {
 			clear_local_cache();
 			new_dyna_start_at(drc_local, target);
@@ -397,12 +410,12 @@ static void ari64_execute_threaded_block(struct psxRegisters *regs,
 
 static void ari64_thread_sync(void)
 {
-	if (!ndrc_g.thread.lock || !ndrc_g.thread.busy)
+	if (!ndrc_g.thread.lock || ndrc_g.thread.busy_addr == ~0u)
 		return;
 	for (;;) {
 		slock_lock(ndrc_g.thread.lock);
 		slock_unlock(ndrc_g.thread.lock);
-		if (!ndrc_g.thread.busy)
+		if (ndrc_g.thread.busy_addr == ~0)
 			break;
 		retro_sleep(0);
 	}
@@ -410,8 +423,8 @@ static void ari64_thread_sync(void)
 
 static int ari64_thread_check_range(unsigned int start, unsigned int end)
 {
-	u32 addr = ndrc_g.thread.addr;
-	if (!addr)
+	u32 addr = ndrc_g.thread.busy_addr;
+	if (addr == ~0u)
 		return 0;
 
 	addr &= 0x1fffffff;
@@ -428,21 +441,25 @@ static int ari64_thread_check_range(unsigned int start, unsigned int end)
 
 static void ari64_compile_thread(void *unused)
 {
+	struct ht_entry *hash_table =
+		*(void **)((char *)dynarec_local + LO_hash_table_ptr);
 	void *target;
 	u32 addr;
 
 	slock_lock(ndrc_g.thread.lock);
 	while (!ndrc_g.thread.exit)
 	{
-		if (!ndrc_g.thread.busy)
+		addr = *(volatile unsigned int *)&ndrc_g.thread.busy_addr;
+		if (addr == ~0u)
 			scond_wait(ndrc_g.thread.cond, ndrc_g.thread.lock);
-		addr = ndrc_g.thread.addr;
-		if (!ndrc_g.thread.busy || !addr || ndrc_g.thread.exit)
+		addr = *(volatile unsigned int *)&ndrc_g.thread.busy_addr;
+		if (addr == ~0u || ndrc_g.thread.exit)
 			continue;
 
-		target = ndrc_get_addr_ht_param(addr, ndrc_cm_compile_in_thread);
+		target = ndrc_get_addr_ht_param(hash_table, addr,
+				ndrc_cm_compile_in_thread);
 		//printf("c  %08x -> %p\n", addr, target);
-		ndrc_g.thread.busy = 0;
+		ndrc_g.thread.busy_addr = ~0u;
 	}
 	slock_unlock(ndrc_g.thread.lock);
 	(void)target;
@@ -472,14 +489,16 @@ static void ari64_thread_shutdown(void)
 		slock_free(ndrc_g.thread.lock);
 		ndrc_g.thread.lock = NULL;
 	}
-	ndrc_g.thread.busy = ndrc_g.thread.addr = 0;
+	ndrc_g.thread.busy_addr = ~0u;
 }
 
 static void ari64_thread_init(void)
 {
 	int enable;
 
-	if (ndrc_g.hacks & NDHACK_THREAD_FORCE)
+	if (ndrc_g.hacks_pergame & NDHACK_THREAD_FORCE)
+		enable = 0;
+	else if (ndrc_g.hacks & NDHACK_THREAD_FORCE)
 		enable = ndrc_g.hacks & NDHACK_THREAD_FORCE_ON;
 	else {
 		u32 cpu_count = cpu_features_get_core_amount();
@@ -494,7 +513,8 @@ static void ari64_thread_init(void)
 		return;
 
 	ari64_thread_shutdown();
-	ndrc_g.thread.busy = ndrc_g.thread.addr = ndrc_g.thread.exit = 0;
+	ndrc_g.thread.exit = 0;
+	ndrc_g.thread.busy_addr = ~0u;
 
 	if (enable) {
 		ndrc_g.thread.lock = slock_new();
@@ -548,7 +568,7 @@ static int ari64_init()
 #endif
 	psxH_ptr = psxH;
 	zeromem_ptr = zero_mem;
-	scratch_buf_ptr = scratch_buf;
+	scratch_buf_ptr = scratch_buf; // for gte_neon.S
 
 	ari64_thread_init();
 
@@ -576,11 +596,6 @@ R3000Acpu psxRec = {
 #else // if DRC_DISABLE
 
 struct ndrc_globals ndrc_g; // dummy
-void *psxH_ptr;
-void *zeromem_ptr;
-u32 zero_mem[0x1000/4];
-void *mem_rtab;
-void *scratch_buf_ptr;
 void new_dynarec_init() {}
 void new_dyna_start(void *context) {}
 void new_dynarec_cleanup() {}

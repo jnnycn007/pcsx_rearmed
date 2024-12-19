@@ -82,6 +82,18 @@ static const char * const fractional_Framerate_hack_db[] =
 	"SCUS94425", "SCES02104",
 };
 
+static const char * const f1_hack_db[] =
+{
+	/* Formula One Arcade */
+	"SCES03886",
+	/* Formula One '99 */
+	"SLUS00870", "SCPS10101", "SCES01979", "SLES01979",
+	/* Formula One 2000 */
+	"SLUS01134", "SCES02777", "SCES02778", "SCES02779",
+	/* Formula One 2001 */
+	"SCES03404", "SCES03423", "SCES03424", "SCES03524",
+};
+
 #define HACK_ENTRY(var, list) \
 	{ #var, &Config.hacks.var, list, ARRAY_SIZE(list) }
 
@@ -100,6 +112,7 @@ hack_db[] =
 	HACK_ENTRY(gpu_timing1024, dualshock_timing1024_hack_db),
 	HACK_ENTRY(dualshock_init_analog, dualshock_init_analog_hack_db),
 	HACK_ENTRY(fractional_Framerate, fractional_Framerate_hack_db),
+	HACK_ENTRY(f1, f1_hack_db),
 };
 
 static const struct
@@ -132,43 +145,22 @@ cycle_multiplier_overrides[] =
 	/* Syphon Filter - reportedly hangs under unknown conditions */
 	{ 169, { "SCUS94240" } },
 	/* Psychic Detective - some weird race condition in the game's cdrom code */
-	{ 222, { "SLUS00165", "SLUS00166", "SLUS00167" } },
-	{ 222, { "SLES00070", "SLES10070", "SLES20070" } },
+	{ 200, { "SLUS00165", "SLUS00166", "SLUS00167" } },
+	{ 200, { "SLES00070", "SLES10070", "SLES20070" } },
 	/* Vib-Ribbon - cd timing issues (PAL+ari64drc only?) */
 	{ 200, { "SCES02873" } },
 	/* Zero Divide - sometimes too fast */
 	{ 200, { "SLUS00183", "SLES00159", "SLPS00083", "SLPM80008" } },
 	/* Eagle One: Harrier Attack - hangs (but not in standalone build?) */
 	{ 153, { "SLUS00943" } },
+	/* Sol Divide: FMV timing */
+	{ 200, { "SLUS01519", "SCPS45260", "SLPS01463" } },
 };
 
-static const struct
+static const char * const lightrec_hack_db[] =
 {
-	const char * const id;
-	u32 hacks;
-}
-lightrec_hacks_db[] =
-{
-	/* Formula One Arcade */
-	{ "SCES03886", LIGHTREC_HACK_INV_DMA_ONLY },
-
-	/* Formula One '99 */
-	{ "SLUS00870", LIGHTREC_HACK_INV_DMA_ONLY },
-	{ "SCPS10101", LIGHTREC_HACK_INV_DMA_ONLY },
-	{ "SCES01979", LIGHTREC_HACK_INV_DMA_ONLY },
-	{ "SLES01979", LIGHTREC_HACK_INV_DMA_ONLY },
-
-	/* Formula One 2000 */
-	{ "SLUS01134", LIGHTREC_HACK_INV_DMA_ONLY },
-	{ "SCES02777", LIGHTREC_HACK_INV_DMA_ONLY },
-	{ "SCES02778", LIGHTREC_HACK_INV_DMA_ONLY },
-	{ "SCES02779", LIGHTREC_HACK_INV_DMA_ONLY },
-
-	/* Formula One 2001 */
-	{ "SCES03404", LIGHTREC_HACK_INV_DMA_ONLY },
-	{ "SCES03423", LIGHTREC_HACK_INV_DMA_ONLY },
-	{ "SCES03424", LIGHTREC_HACK_INV_DMA_ONLY },
-	{ "SCES03524", LIGHTREC_HACK_INV_DMA_ONLY },
+	/* Tomb Raider (Rev 2) - boot menu clears over itself */
+	"SLUS00152",
 };
 
 /* Function for automatic patching according to GameID. */
@@ -211,6 +203,8 @@ void Apply_Hacks_Cdrom(void)
 
 	/* Dynarec game-specific hacks */
 	ndrc_g.hacks_pergame = 0;
+	if (Config.hacks.f1)
+		ndrc_g.hacks_pergame |= NDHACK_THREAD_FORCE; // force without *_ON -> off
 	Config.cycle_multiplier_override = 0;
 
 	for (i = 0; i < ARRAY_SIZE(cycle_multiplier_overrides); i++)
@@ -229,15 +223,15 @@ void Apply_Hacks_Cdrom(void)
 		}
 	}
 
-	lightrec_hacks = 0;
-
-	for (i = 0; drc_is_lightrec() && i < ARRAY_SIZE(lightrec_hacks_db); i++) {
-		if (strcmp(CdromId, lightrec_hacks_db[i].id) == 0)
-		{
-			lightrec_hacks = lightrec_hacks_db[i].hacks;
+	if (drc_is_lightrec()) {
+		lightrec_hacks = 0;
+		if (Config.hacks.f1)
+			lightrec_hacks |= LIGHTREC_HACK_INV_DMA_ONLY;
+		for (i = 0; i < ARRAY_SIZE(lightrec_hack_db); i++)
+			if (strcmp(lightrec_hack_db[i], CdromId) == 0)
+				lightrec_hacks |= LIGHTREC_HACK_INV_DMA_ONLY;
+		if (lightrec_hacks)
 			SysPrintf("using lightrec_hacks: 0x%x\n", lightrec_hacks);
-			break;
-		}
 	}
 }
 

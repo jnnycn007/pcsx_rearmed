@@ -75,6 +75,7 @@ extern int last_count;  // last absolute target, often = next_interupt
 
 extern int reg_cop2d[], reg_cop2c[];
 
+extern void *hash_table_ptr;
 extern uintptr_t ram_offset;
 extern uintptr_t mini_ht[32][2];
 
@@ -400,7 +401,7 @@ void jump_to_new_pc();
 void call_gteStall();
 void new_dyna_leave();
 
-void *ndrc_get_addr_ht(u_int vaddr);
+void *ndrc_get_addr_ht(u_int vaddr, struct ht_entry *ht);
 void ndrc_add_jump_out(u_int vaddr, void *src);
 void ndrc_write_invalidate_one(u_int addr);
 static void ndrc_write_invalidate_many(u_int addr, u_int end);
@@ -473,12 +474,7 @@ static void mprotect_w_x(void *start, void *end, int is_x)
 #endif
 }
 
-static void start_tcache_write(void *start, void *end)
-{
-  mprotect_w_x(start, end, 0);
-}
-
-static void end_tcache_write(void *start, void *end)
+void new_dyna_clear_cache(void *start, void *end)
 {
 #if defined(__arm__) || defined(__aarch64__)
   size_t len = (char *)end - (char *)start;
@@ -494,7 +490,6 @@ static void end_tcache_write(void *start, void *end)
     ctr_clear_cache_range(start, end);
   else
     ctr_clear_cache();
-  ndrc_g.thread.cache_dirty = 1;
   #elif defined(HAVE_LIBNX)
   if (g_jit.type == JitType_CodeMemory) {
     armDCacheClean(start, len);
@@ -511,6 +506,22 @@ static void end_tcache_write(void *start, void *end)
   #endif
   (void)len;
 #endif
+}
+
+static void start_tcache_write(void *start, void *end)
+{
+  mprotect_w_x(start, end, 0);
+}
+
+static void end_tcache_write(void *start, void *end)
+{
+#ifdef NDRC_THREAD
+  if (!ndrc_g.thread.dirty_start || (size_t)ndrc_g.thread.dirty_start > (size_t)start)
+    ndrc_g.thread.dirty_start = start;
+  if ((size_t)ndrc_g.thread.dirty_end < (size_t)end)
+    ndrc_g.thread.dirty_end = end;
+#endif
+  new_dyna_clear_cache(start, end);
 
   mprotect_w_x(start, end, 1);
 }
@@ -642,9 +653,14 @@ static u_int get_page_prev(u_int vaddr)
   return page;
 }
 
+static struct ht_entry *hash_table_get_p(struct ht_entry *ht, u_int vaddr)
+{
+  return &ht[((vaddr >> 16) ^ vaddr) & 0xFFFF];
+}
+
 static struct ht_entry *hash_table_get(u_int vaddr)
 {
-  return &hash_table[((vaddr>>16)^vaddr)&0xFFFF];
+  return hash_table_get_p(hash_table, vaddr);
 }
 
 #define HASH_TABLE_BAD 0xbac
@@ -805,7 +821,8 @@ static noinline u_int generate_exception(u_int pc)
 
 // Get address from virtual address
 // This is called from the recompiled JR/JALR instructions
-static void noinline *get_addr(const u_int vaddr, enum ndrc_compile_mode compile_mode)
+static void noinline *get_addr(struct ht_entry *ht, const u_int vaddr,
+  enum ndrc_compile_mode compile_mode)
 {
   u_int start_page = get_page_prev(vaddr);
   u_int i, page, end_page = get_page(vaddr);
@@ -846,31 +863,32 @@ static void noinline *get_addr(const u_int vaddr, enum ndrc_compile_mode compile
 
   int r = new_recompile_block(vaddr);
   if (likely(r == 0))
-    return ndrc_get_addr_ht(vaddr);
+    return ndrc_get_addr_ht(vaddr, ht);
 
   if (compile_mode == ndrc_cm_compile_live)
-    return ndrc_get_addr_ht(generate_exception(vaddr));
+    return ndrc_get_addr_ht(generate_exception(vaddr), ht);
 
   return NULL;
 }
 
 // Look up address in hash table first
-void *ndrc_get_addr_ht_param(unsigned int vaddr, enum ndrc_compile_mode compile_mode)
+void *ndrc_get_addr_ht_param(struct ht_entry *ht, unsigned int vaddr,
+  enum ndrc_compile_mode compile_mode)
 {
   //check_for_block_changes(vaddr, vaddr + MAXBLOCK);
-  const struct ht_entry *ht_bin = hash_table_get(vaddr);
+  const struct ht_entry *ht_bin = hash_table_get_p(ht, vaddr);
   u_int vaddr_a = vaddr & ~3;
   stat_inc(stat_ht_lookups);
   if (ht_bin->vaddr[0] == vaddr_a) return ht_bin->tcaddr[0];
   if (ht_bin->vaddr[1] == vaddr_a) return ht_bin->tcaddr[1];
-  return get_addr(vaddr, compile_mode);
+  return get_addr(ht, vaddr, compile_mode);
 }
 
 // "usual" addr lookup for indirect branches, etc
 // to be used by currently running code only
-void *ndrc_get_addr_ht(u_int vaddr)
+void *ndrc_get_addr_ht(u_int vaddr, struct ht_entry *ht)
 {
-  return ndrc_get_addr_ht_param(vaddr, ndrc_cm_compile_live);
+  return ndrc_get_addr_ht_param(ht, vaddr, ndrc_cm_compile_live);
 }
 
 static void clear_all_regs(signed char regmap[])
@@ -1317,6 +1335,7 @@ static const char *fpofs_name(u_int ofs)
   ofscase(psxH_ptr);
   ofscase(invc_ptr);
   ofscase(ram_offset);
+  ofscase(hash_table_ptr);
   #undef ofscase
   }
   buf[0] = 0;
@@ -3439,9 +3458,10 @@ static void store_assemble(int i, const struct regstat *i_regs, int ccadj_)
     if(i_regs->regmap==regs[i].regmap) {
       load_all_consts(regs[i].regmap_entry,regs[i].wasdirty,i);
       wb_dirtys(regs[i].regmap_entry,regs[i].wasdirty);
-      emit_movimm(start+i*4+4,0);
-      emit_writeword(0,&psxRegs.pc);
-      emit_addimm(HOST_CCREG,2,HOST_CCREG);
+      emit_readptr(&hash_table_ptr, 1);
+      emit_movimm(start+i*4+4, 0);
+      emit_writeword(0, &psxRegs.pc);
+      emit_addimm(HOST_CCREG, 2, HOST_CCREG);
       emit_far_call(ndrc_get_addr_ht);
       emit_jmpreg(0);
     }
@@ -3620,6 +3640,7 @@ static void cop0_assemble(int i, const struct regstat *i_regs, int ccadj_)
       emit_cmp(HOST_TEMPREG, 0);
       void *jaddr = out;
       emit_jeq(0);
+      emit_readptr(&hash_table_ptr, 1);
       emit_far_call(ndrc_get_addr_ht);
       emit_jmpreg(0);
       set_jump_target(jaddr, out);
@@ -6281,13 +6302,13 @@ void new_dynarec_clear_full(void)
   stat_clear(stat_links);
 
   if (ndrc_g.cycle_multiplier_old != Config.cycle_multiplier
-      || ndrc_g.hacks_old != ndrc_g.hacks)
+      || ndrc_g.hacks_old != (ndrc_g.hacks | ndrc_g.hacks_pergame))
   {
     SysPrintf("ndrc config: mul=%d, ha=%x, pex=%d\n",
       get_cycle_multiplier(), ndrc_g.hacks, Config.PreciseExceptions);
   }
   ndrc_g.cycle_multiplier_old = Config.cycle_multiplier;
-  ndrc_g.hacks_old = ndrc_g.hacks;
+  ndrc_g.hacks_old = ndrc_g.hacks | ndrc_g.hacks_pergame;
 }
 
 static int pgsize(void)
@@ -6311,12 +6332,13 @@ void new_dynarec_init(void)
   #ifdef VITA
   sceBlock = getVMBlock(); //sceKernelAllocMemBlockForVM("code", sizeof(*ndrc));
   if (sceBlock <= 0)
-    SysPrintf("sceKernelAllocMemBlockForVM failed: %x\n", sceBlock);
+    SysPrintf("getVMBlock failed: %x\n", sceBlock);
   int ret = sceKernelGetMemBlockBase(sceBlock, (void **)&ndrc);
-  if (ret < 0)
-    SysPrintf("sceKernelGetMemBlockBase failed: %x\n", ret);
-  sceKernelOpenVMDomain();
-  sceClibPrintf("translation_cache = 0x%08lx\n ", (long)ndrc->translation_cache);
+  if (ret)
+    SysPrintf("sceKernelGetMemBlockBase: %x\n", ret);
+  ret = sceKernelOpenVMDomain();
+  if (ret)
+    SysPrintf("sceKernelOpenVMDomain: %x\n", ret);
   #elif defined(_MSC_VER)
   ndrc = VirtualAlloc(NULL, sizeof(*ndrc), MEM_COMMIT | MEM_RESERVE,
     PAGE_EXECUTE_READWRITE);
@@ -6368,6 +6390,7 @@ void new_dynarec_init(void)
 #endif
   out = ndrc->translation_cache;
   new_dynarec_clear_full();
+  hash_table_ptr = hash_table;
 #ifdef HOST_IMM8
   // Copy this into local area so we don't have to put it in every literal pool
   invc_ptr=invalid_code;
@@ -6542,7 +6565,7 @@ void new_dynarec_load_blocks(const void *save, int size)
         psxRegs.GPR.r[i] = 0x1f800000;
     }
 
-    ndrc_get_addr_ht_param(sblocks[b].addr, ndrc_cm_compile_offline);
+    ndrc_get_addr_ht_param(hash_table, sblocks[b].addr, ndrc_cm_compile_offline);
 
     for (f = sblocks[b].regflags, i = 0; f; f >>= 1, i++) {
       if (f & 1)
@@ -8989,7 +9012,7 @@ static struct block_info *new_block_info(u_int start, u_int len,
   return block;
 }
 
-static int new_recompile_block(u_int addr)
+static int noinline new_recompile_block(u_int addr)
 {
   u_int pagelimit = 0;
   u_int state_rflags = 0;
@@ -9038,6 +9061,7 @@ static int new_recompile_block(u_int addr)
     emit_addimm(0, 0x18, 0);
     emit_adds_ptr(1, 1, 1);
     emit_ldr_dualindexed(1, 0, 0);
+    emit_readptr(&hash_table_ptr, 1);
     emit_writeword(0, &psxRegs.GPR.r[26]); // lw k0, 0x18(sp)
     emit_far_call(ndrc_get_addr_ht);
     emit_jmpreg(0); // jr k0

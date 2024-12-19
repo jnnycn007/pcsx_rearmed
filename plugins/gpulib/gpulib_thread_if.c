@@ -76,6 +76,15 @@ static void *video_thread_main(void *arg) {
 	static int processed = 0;
 #endif /* _3DS */
 
+#if defined(__arm__) && defined(__ARM_FP)
+	// RunFast mode
+	uint32_t fpscr = ~0;
+	__asm__ volatile("vmrs %0, fpscr" : "=r"(fpscr));
+	fpscr &= ~0x00009f9f;
+	fpscr |=  0x03000000; // DN | FZ
+	__asm__ volatile("vmsr fpscr, %0" :: "r"(fpscr));
+#endif
+
 	while(1) {
 		int result, cycles_dummy = 0, last_cmd, start, end;
 		video_thread_queue *queue;
